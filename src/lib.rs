@@ -15,10 +15,8 @@
 //! generalized beyond this single usecase.
 //!
 //! A diagram of a buffer in-use might look something like this:
-//! ```
-//! Buffer : [ e0, e1, e2, e3, e4 ]
-//! Handles: [ h0, h1,  _, h2,  _ ]
-//! ```
+//! > Buffer : [ e0, e1, e2, e3, e4 ]
+//! > Handles: [ h0, h1,  _, h2,  _ ]
 //! Here, there are handles to the first, second, and fourth elements in the buffer. Each handle is
 //! able to make arbitary reads and writes to its element. In order for another handle to gain
 //! access to those changes, the handle must reliquish its access to that element. This can happen
@@ -30,19 +28,15 @@
 //! Let's say both `h1` and `h2` rotate.
 //! Note that, rotations happen independently for each handle and that one handle can not force another to rotate.
 //! The state of the buffer would now looks like this:
-//! ```
-//! Buffer : [ e0, e1, e2, e3, e4 ]
-//! Handles: [ h0,  _, h1,  _, h2 ]
-//! ```
+//! > Buffer : [ e0, e1, e2, e3, e4 ]
+//! > Handles: [ h0,  _, h1,  _, h2 ]
 //! After those rotations occur, `h0` can now rotate and `h1` can rotate yet again. Should `h0`
 //! rotate, `h2` could then rotate. This would put `h2` back at the front of the buffer. Once
 //! allocated, the buffer's capacity is fixed.
 //!
 //! At this point, the state of the buffer looks like this:
-//! ```
-//! Buffer : [ e0, e1, e2, e3, e4 ]
-//! Handles: [ h2, h0, h1,  _,  _ ]
-//! ```
+//! > Buffer : [ e0, e1, e2, e3, e4 ]
+//! > Handles: [ h2, h0, h1,  _,  _ ]
 //! Note that handles can only move in a single direction. It is possible for two handles to swap
 //! indices, but it is not possible to reverse the direction that handles move. Handles will always
 //! increase this index (modulo the number of elements).
