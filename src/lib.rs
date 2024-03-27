@@ -1,10 +1,13 @@
 use std::{
     cell::UnsafeCell,
+    future::Future,
     ops::{Deref, DerefMut},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    task::{Context, Poll, Waker},
 };
 
 /// This marker type acts as a compile-time bounds check on the requires of a triplicate, namely
@@ -54,6 +57,8 @@ pub struct TriplicateHandle<T, const L: usize = 3> {
     index: usize,
     buffer: Arc<TriplicateInner<L, T>>,
 }
+
+pub struct RotationFailure;
 
 /// This error is returned during construction of a triplacate buffer whose bounds are checked at
 /// runtime instead of compile-time. [TriplicateBounds] can be used to avoid this error during
@@ -131,16 +136,16 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
     /// Attempts to move the handle over by one element. If another handle has access to the next element,
     /// this method return `None`; otherwise, a mutable reference to the new item is
     /// returned.
-    pub fn try_rotate(&mut self) -> Option<&mut T> {
+    pub fn try_rotate(&mut self) -> Result<&mut T, RotationFailure> {
         if !self.can_rotate() {
-            return None;
+            return Err(RotationFailure);
         }
         let mask = u64::MAX & !(0b1 << self.index);
         self.index = self.next_index();
         let val = 0b1 << self.next_index();
         self.buffer.indices.fetch_or(val, Ordering::Relaxed);
         self.buffer.indices.fetch_add(mask, Ordering::Relaxed);
-        Some(&mut *self)
+        Ok(&mut *self)
     }
 
     fn next_index(&self) -> usize {
@@ -164,7 +169,12 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
     /// If this future is cancelled/dropped, the rotation does not happen. Reads and writes will
     /// affect the original object.
     pub async fn rotate(&mut self) -> &mut T {
-        todo!()
+        let fut = RotationFut {
+            waker: None,
+            handle: self,
+        };
+        fut.await;
+        &mut *self
     }
 
     /// Returns a count of the active handles.
@@ -200,7 +210,11 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
         if self.handle_count() + 1 == L as u32 {
             return None;
         }
-        todo!()
+        let fut = CreationFut {
+            waker: None,
+            handle: self,
+        };
+        Some(fut.await)
     }
 
     /// Swaps the location of the two handles inside the triplicate buffer. This does not affect
@@ -252,6 +266,57 @@ impl<const L: usize, T> Drop for TriplicateHandle<T, L> {
     }
 }
 
+// TODO: Docs
+#[must_use = "The rotate method returns a future that must be `await`ed. Dropping this will leave the handle unrotated"]
+struct RotationFut<'a, T, const L: usize> {
+    waker: Option<Waker>,
+    handle: &'a mut TriplicateHandle<T, L>,
+}
+
+impl<'a, T, const L: usize> Future for RotationFut<'a, T, L> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.handle.try_rotate() {
+            Ok(_) => Poll::Ready(()),
+            Err(_) => {
+                match this.waker.as_mut() {
+                    None => this.waker = Some(cx.waker().clone()),
+                    Some(waker) => waker.clone_from(cx.waker()),
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+// TODO: Docs
+#[must_use = "The rotate method returns a future that must be `await`ed. Dropping this will leave the handle unrotated"]
+struct CreationFut<'a, T, const L: usize> {
+    waker: Option<Waker>,
+    handle: &'a mut TriplicateHandle<T, L>,
+}
+
+impl<'a, T, const L: usize> Future for CreationFut<'a, T, L> {
+    type Output = TriplicateHandle<T, L>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.handle.try_create_handle() {
+            Ok(handle) => Poll::Ready(handle),
+            Err(_) => {
+                match this.waker.as_mut() {
+                    None => this.waker = Some(cx.waker().clone()),
+                    Some(waker) => waker.clone_from(cx.waker()),
+                }
+                Poll::Pending
+            }
+        }
+    }
+}
+
+// TODO: Docs
 struct TriplicateInner<const L: usize, T> {
     data: [UnsafeCell<T>; L],
     indices: AtomicU64,
