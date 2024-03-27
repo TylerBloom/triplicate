@@ -2,7 +2,10 @@
 use std::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
-    sync::{atomic::{AtomicU64, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 /// This marker type acts as a compile-time bounds check on the requires of a triplicate, namely
@@ -27,8 +30,17 @@ impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
     }
 
     pub fn construct_with<T, F: FnMut() -> T>(self, f: F) -> [TriplicateHandle<L, T>; L] {
-        let inner = Arc::new(TriplicateInner::<L, T>::new(H, f));
-        todo!()
+        let buffer = Arc::new(TriplicateInner::<L, T>::new(H, f));
+        let mut index = 0;
+        // TODO: Surely there is a better way to do this...
+        [(); L].map(|()| {
+            let handle = TriplicateHandle {
+                index,
+                buffer: buffer.clone(),
+            };
+            index += 1;
+            handle
+        })
     }
 
     pub fn construct_with_copies<T: Clone>(self, val: T) -> [TriplicateHandle<L, T>; L] {
@@ -43,11 +55,24 @@ pub struct TriplicateHandle<const L: usize, T> {
 }
 
 impl<const L: usize, T> TriplicateHandle<L, T> {
+    /// Calculates if two handles are associated with the same triplicate buffer.
+    pub fn same_buffer(&self, other: &Self) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.buffer), Arc::as_ptr(&other.buffer))
+    }
+
     /// Attempts to move the handle over by one element. If another handle has access to the next element,
     /// this method return `None`; otherwise, a mutable reference to the new item is
     /// returned.
     pub fn try_rotate(&mut self) -> Option<&mut T> {
-        todo!()
+        if !self.can_rotate() {
+            return None;
+        }
+        let mask = u64::MAX & !(0b1 << self.index);
+        self.index = self.next_index();
+        let val = 0b1 << self.next_index();
+        self.buffer.indices.fetch_or(val, Ordering::Relaxed);
+        self.buffer.indices.fetch_add(mask, Ordering::Relaxed);
+        Some(&mut *self)
     }
 
     fn next_index(&self) -> usize {
@@ -81,7 +106,19 @@ impl<const L: usize, T> TriplicateHandle<L, T> {
 
     /// Similar to `Self::create_handle` but will not wait for a spot to become available.
     pub fn try_create_handle(&mut self) -> Result<Self, TryCreateHandleError> {
-        todo!()
+        if !self.can_rotate() {
+            return Err(TryCreateHandleError::SlotInUse);
+        }
+        if self.handle_count() + 1 == L as u32 {
+            return Err(TryCreateHandleError::MaxHandles);
+        }
+        let digest = Self {
+            index: self.next_index(),
+            buffer: self.buffer.clone(),
+        };
+        let val = 0b1 << self.next_index();
+        self.buffer.indices.fetch_or(val, Ordering::Relaxed);
+        Ok(digest)
     }
 
     /// Attempts to create a new handle to the triplicate buffer. The new handle will be placed
@@ -92,6 +129,9 @@ impl<const L: usize, T> TriplicateHandle<L, T> {
     /// this case, this method will eagerly fail and will not wait for an empty spot to become
     /// available.
     pub async fn create_handle(&mut self) -> Option<Self> {
+        if self.handle_count() + 1 == L as u32 {
+            return None;
+        }
         todo!()
     }
 
@@ -137,9 +177,10 @@ impl<const L: usize, T> DerefMut for TriplicateHandle<L, T> {
 }
 
 impl<const L: usize, T> Drop for TriplicateHandle<L, T> {
-    // This holds the handles active index. That bit needs to be cleared on drop.
     fn drop(&mut self) {
-        todo!()
+        let mask = u64::MAX & !(0b1 << self.index);
+        // Mask out this handles active index, making it available for other handles to use.
+        self.buffer.indices.fetch_and(mask, Ordering::Relaxed);
     }
 }
 
