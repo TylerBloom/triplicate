@@ -1,3 +1,64 @@
+//! ## Overview
+//! This crate implements a simple, lock-free (but not wait-free) concurrency primitive. This
+//! primitive consists of a buffer of N elements and M handles to this buffer. Every handle has an
+//! index into the buffer that is gaurnteed to be unique from the other handles. Which elements
+//! have indices to them is tracked atomically. This provides ensures that every handle has
+//! exclusive access to its element.
+//!
+//! Note, changes between buffer elements are not transmitted in any way. Rather, handles
+//! independently "rotate" around the buffer. Allowing handles to passively communicate changes.
+//!
+//! This primitive was developed with the primary usecase of a three-element buffer of byte arrays
+//! with two handles. One handle performs writes into a given byte array, releases the changes to
+//! the reader who releases items after performing any necessary operations. This is the source of
+//! the name "triplicate" (a document that has three copies made), but the idea has been
+//! generalized beyond this single usecase.
+//!
+//! A diagram of a buffer in-use might look something like this:
+//! ```
+//! Buffer : [ e0, e1, e2, e3, e4 ]
+//! Handles: [ h0, h1,  _, h2,  _ ]
+//! ```
+//! Here, there are handles to the first, second, and fourth elements in the buffer. Each handle is
+//! able to make arbitary reads and writes to its element. In order for another handle to gain
+//! access to those changes, the handle must reliquish its access to that element. This can happen
+//! by dropping the handle, or, more commonly, rotating the handle's index. In this example,
+//! both `h1` and `h2` can add one to their index in order to gain access to the next item and
+//! release access to their current item. Note that the first handle can not increment its index as
+//! there is a handle already there.
+//!
+//! Let's say both `h1` and `h2` rotate.
+//! Note that, rotations happen independently for each handle and that one handle can not force another to rotate.
+//! The state of the buffer would now looks like this:
+//! ```
+//! Buffer : [ e0, e1, e2, e3, e4 ]
+//! Handles: [ h0,  _, h1,  _, h2 ]
+//! ```
+//! After those rotations occur, `h0` can now rotate and `h1` can rotate yet again. Should `h0`
+//! rotate, `h2` could then rotate. This would put `h2` back at the front of the buffer. Once
+//! allocated, the buffer's capacity is fixed.
+//!
+//! At this point, the state of the buffer looks like this:
+//! ```
+//! Buffer : [ e0, e1, e2, e3, e4 ]
+//! Handles: [ h2, h0, h1,  _,  _ ]
+//! ```
+//! Note that handles can only move in a single direction. It is possible for two handles to swap
+//! indices, but it is not possible to reverse the direction that handles move. Handles will always
+//! increase this index (modulo the number of elements).
+//!
+//! ## Restrictions
+//! There are two primary invariants that the buffer must maintain:
+//!  - There can not be more than 64 elements
+//!  - The number of handles must be strictly less than the number of elements in the buffer.
+//!
+//! The first requirement is a result of how handle locations are tracked.
+//! The second requirement is straightforward. If there were an equal number of handles and
+//! elements, no handle could rotate.
+//! To uphold these bounds, the triplicate buffer uses compile-time assertions.
+//! These are provided through the `TriplicateBounds` type.
+//! There is also a runtime-checked API available directly on the `TriplicateHandle` type.
+
 use std::{
     cell::UnsafeCell,
     future::Future,
@@ -40,7 +101,7 @@ impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
         // SAFETY CHECK:
         // This type can not be constructed without upholding the necessary invariants at compile
         // time; therefore, we can freely construct the buffer.
-        let buffer = Arc::new(unsafe { TriplicateInner::<L, T>::new(H, f) });
+        let buffer = Arc::new(unsafe { TriplicateInner::<T, L>::new(H, f) });
         std::array::from_fn(|index| TriplicateHandle {
             index,
             buffer: buffer.clone(),
@@ -55,7 +116,7 @@ impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
 /// The main interface into the inner buffer.
 pub struct TriplicateHandle<T, const L: usize = 3> {
     index: usize,
-    buffer: Arc<TriplicateInner<L, T>>,
+    buffer: Arc<TriplicateInner<T, L>>,
 }
 
 pub struct RotationFailure;
@@ -75,7 +136,7 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
     /// This method is marked as `unsafe` because it constructs the inner buffer. The caller needs
     /// to uphold the same invariants as `TriplicateBuffer::new`.
     unsafe fn construct<F: FnMut() -> T>(count: usize, f: F) -> Vec<Self> {
-        let buffer = Arc::new(TriplicateInner::<L, T>::new(count, f));
+        let buffer = Arc::new(TriplicateInner::<T, L>::new(count, f));
         let mut index = 0;
         std::iter::from_fn(|| {
             let digest = TriplicateHandle {
@@ -317,12 +378,12 @@ impl<'a, T, const L: usize> Future for CreationFut<'a, T, L> {
 }
 
 // TODO: Docs
-struct TriplicateInner<const L: usize, T> {
+struct TriplicateInner<T, const L: usize = 3> {
     data: [UnsafeCell<T>; L],
     indices: AtomicU64,
 }
 
-impl<const L: usize, T> TriplicateInner<L, T> {
+impl<const L: usize, T> TriplicateInner<T, L> {
     /// SAFETY:
     /// This method is marked as `unsafe` because it does not check that `L` or `count` uphold the
     /// required safety invariants. The caller must ensure:
@@ -342,7 +403,7 @@ impl<const L: usize, T> TriplicateInner<L, T> {
 }
 
 // TODO: Need to do extra verification around this...
-unsafe impl<const L: usize, T> Sync for TriplicateInner<L, T> where T: Send + Sync {}
+unsafe impl<const L: usize, T> Sync for TriplicateInner<T, L> where T: Send + Sync {}
 
 #[cfg(test)]
 mod tests {
