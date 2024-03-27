@@ -1,4 +1,3 @@
-#![allow(dead_code, unused)]
 use std::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
@@ -10,7 +9,14 @@ use std::{
 
 /// This marker type acts as a compile-time bounds check on the requires of a triplicate, namely
 /// that `L > H` and `L <= 64`.
+///
+/// This type is marked `non_exhaustive` and must be constructed via its const `new` constructor.
+/// This constructor checks necessary invariants before providing access to constructor methods for
+/// the buffer.
+#[non_exhaustive]
 pub struct TriplicateBounds<const L: usize, const H: usize>;
+
+impl<const L: usize, const H: usize> TriplicateBounds<L, H> {}
 
 impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
     pub const fn new() -> Self {
@@ -30,17 +36,12 @@ impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
     }
 
     pub fn construct_with<T, F: FnMut() -> T>(self, f: F) -> [TriplicateHandle<L, T>; L] {
-        let buffer = Arc::new(TriplicateInner::<L, T>::new(H, f));
-        let mut index = 0;
-        // TODO: Surely there is a better way to do this...
-        [(); L].map(|()| {
-            let handle = TriplicateHandle {
-                index,
-                buffer: buffer.clone(),
-            };
-            index += 1;
-            handle
-        })
+        // SAFETY CHECK:
+        // The `construct` method is unsafe because it requires that the provided count is and the
+        // number of elements upholds the required bounds (L is at most 64 and the provided count
+        // is strictly less than L). This type can not be constructed without upholding those
+        // requirements, so this is safe.
+        unsafe { TriplicateHandle::<L, T>::construct(H, f) }
     }
 
     pub fn construct_with_copies<T: Clone>(self, val: T) -> [TriplicateHandle<L, T>; L] {
@@ -54,7 +55,63 @@ pub struct TriplicateHandle<const L: usize, T> {
     buffer: Arc<TriplicateInner<L, T>>,
 }
 
+/// This error is returned during construction of a triplacate buffer whose bounds are checked at
+/// runtime instead of compile-time. [TriplicateBounds] can be used to avoid this error during
+/// runtime.
+pub enum TriplicateConstructionError {
+    TooManyElements,
+    TooManyHandles,
+}
+
 impl<const L: usize, T> TriplicateHandle<L, T> {
+    /// Constructs the triplicate buffer and `count` many handles to it.
+    ///
+    /// SAFETY:
+    /// This method is marked as `unsafe` because it does not check that `L` or `count` uphold the
+    /// required safety invariants. The caller must ensure:
+    ///  - `L` is at most 64
+    ///  - `count` is strictly less than `L`
+    unsafe fn construct<F: FnMut() -> T>(count: usize, f: F) -> [Self; L] {
+        let buffer = Arc::new(TriplicateInner::<L, T>::new(count, f));
+        std::array::from_fn(|index| TriplicateHandle {
+            index,
+            buffer: buffer.clone(),
+        })
+    }
+
+    /// Attempts to construct a
+    pub fn try_construct(count: usize) -> Result<[Self; L], TriplicateConstructionError>
+    where
+        T: Default,
+    {
+        Self::try_construct_with(count, Default::default)
+    }
+
+    pub fn try_construct_with<F: FnMut() -> T>(
+        count: usize,
+        f: F,
+    ) -> Result<[Self; L], TriplicateConstructionError> {
+        if L > 64 {
+            Err(TriplicateConstructionError::TooManyElements)
+        } else if count >= L {
+            Err(TriplicateConstructionError::TooManyHandles)
+        } else {
+            // SAFETY CHECK:
+            // The above if-elses check the necessary invariants
+            Ok(unsafe { Self::construct(count, f) })
+        }
+    }
+
+    pub fn try_construct_with_clone(
+        count: usize,
+        val: T,
+    ) -> Result<[Self; L], TriplicateConstructionError>
+    where
+        T: Clone,
+    {
+        Self::try_construct_with(count, || val.clone())
+    }
+
     /// Calculates if two handles are associated with the same triplicate buffer.
     pub fn same_buffer(&self, other: &Self) -> bool {
         std::ptr::eq(Arc::as_ptr(&self.buffer), Arc::as_ptr(&other.buffer))
@@ -95,7 +152,7 @@ impl<const L: usize, T> TriplicateHandle<L, T> {
     /// # Note
     /// If this future is cancelled/dropped, the rotation does not happen. Reads and writes will
     /// affect the original object.
-    async fn rotate(&mut self) -> &mut T {
+    pub async fn rotate(&mut self) -> &mut T {
         todo!()
     }
 
