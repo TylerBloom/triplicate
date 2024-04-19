@@ -119,22 +119,22 @@ impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
 
     /// This method is called at runtime, but we already know that the bound conditions have
     /// already been statisfied because this struct can only be constructed at compile time.
-    pub fn construct<T: Default>(self) -> [TriplicateHandle<T, L>; H] {
+    pub fn construct<T: Default>(self) -> [TriplicateHandle<T>; H] {
         self.construct_with(Default::default)
     }
 
-    pub fn construct_with<T, F: FnMut() -> T>(self, f: F) -> [TriplicateHandle<T, L>; H] {
+    pub fn construct_with<T, F: FnMut() -> T>(self, f: F) -> [TriplicateHandle<T>; H] {
         // SAFETY CHECK:
         // This type can not be constructed without upholding the necessary invariants at compile
         // time; therefore, we can freely construct the buffer.
-        let buffer = Arc::new(unsafe { TriplicateInner::<T, L>::new(H, f) });
+        let buffer = Arc::new(unsafe { new_triplicate_inner::<L, _, _>(H, f) });
         std::array::from_fn(|index| TriplicateHandle {
             index,
             buffer: buffer.clone(),
         })
     }
 
-    pub fn construct_with_copies<T: Clone>(self, val: T) -> [TriplicateHandle<T, L>; H] {
+    pub fn construct_with_copies<T: Clone>(self, val: T) -> [TriplicateHandle<T>; H] {
         self.construct_with(|| val.clone())
     }
 }
@@ -146,9 +146,9 @@ impl<const L: usize, const H: usize> Default for TriplicateBounds<L, H> {
 }
 
 /// The main interface into the inner buffer.
-pub struct TriplicateHandle<T, const L: usize = 3> {
+pub struct TriplicateHandle<T> {
     index: usize,
-    buffer: Arc<TriplicateInner<T, L>>,
+    buffer: Arc<TriplicateInner<[InnerCell<T>]>>,
 }
 
 pub struct RotationFailure;
@@ -161,14 +161,14 @@ pub enum TriplicateConstructionError {
     TooManyHandles,
 }
 
-impl<const L: usize, T> TriplicateHandle<T, L> {
+impl<T> TriplicateHandle<T> {
     /// Constructs the triplicate buffer and `count` many handles to it.
     ///
     /// SAFETY:
     /// This method is marked as `unsafe` because it constructs the inner buffer. The caller needs
     /// to uphold the same invariants as `TriplicateBuffer::new`.
-    unsafe fn construct<F: FnMut() -> T>(count: usize, f: F) -> Vec<Self> {
-        let buffer = Arc::new(TriplicateInner::<T, L>::new(count, f));
+    unsafe fn construct<const L: usize, F: FnMut() -> T>(count: usize, f: F) -> Vec<Self> {
+        let buffer = Arc::new(new_triplicate_inner::<L, _, _>(count, f));
         let mut index = 0;
         std::iter::from_fn(|| {
             let digest = TriplicateHandle {
@@ -183,17 +183,17 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
 
     /// Attempts to construct a triplicate buffer by moving to runtime the checks that `TriplicateBounds`
     /// provides at compile-time. This method will create a buffer full of default values.
-    pub fn try_construct(count: usize) -> Result<Vec<Self>, TriplicateConstructionError>
+    pub fn try_construct<const L: usize>(count: usize) -> Result<Vec<Self>, TriplicateConstructionError>
     where
         T: Default,
     {
-        Self::try_construct_with(count, Default::default)
+        Self::try_construct_with::<L, _>(count, Default::default)
     }
 
     /// Attempts to construct a triplicate buffer by moving to runtime the checks that `TriplicateBounds`
     /// provides at compile-time. This method will create a buffer filled with the values returned
     /// from the provided function and in the same order that they are produced.
-    pub fn try_construct_with<F: FnMut() -> T>(
+    pub fn try_construct_with<const L: usize, F: FnMut() -> T>(
         count: usize,
         f: F,
     ) -> Result<Vec<Self>, TriplicateConstructionError> {
@@ -204,21 +204,21 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
         } else {
             // SAFETY CHECK:
             // The above if-elses check the necessary invariants
-            Ok(unsafe { Self::construct(count, f) })
+            Ok(unsafe { Self::construct::<L, _>(count, f) })
         }
     }
 
-    /// Attempts to construct a triplicate buffer by moving to runtime the checks that `TriplicateBounds`
-    /// provides at compile-time. This method will create a buffer filled with clones of the given
-    /// value.
-    pub fn try_construct_with_clone(
+    /// Attempts to construct a triplicate buffer by moving the checks that `TriplicateBounds`
+    /// provides at compile-time to runtime. This method will create a buffer filled with clones of
+    /// the given value.
+    pub fn try_construct_with_clone<const L: usize>(
         count: usize,
         val: T,
     ) -> Result<Vec<Self>, TriplicateConstructionError>
     where
         T: Clone,
     {
-        Self::try_construct_with(count, || val.clone())
+        Self::try_construct_with::<L, _>(count, || val.clone())
     }
 
     /// Calculates if two handles are associated with the same triplicate buffer.
@@ -242,13 +242,12 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
     }
 
     fn next_index(&self) -> usize {
-        if self.index + 1 >= L {
+        if self.index + 1 >= self.buffer.data.len() {
             0
         } else {
             self.index + 1
         }
     }
-
 
     /// Checks to see if there is another handle preventing this handle from rotating.
     pub fn can_rotate(&self) -> bool {
@@ -281,7 +280,7 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
         if !self.can_rotate() {
             return Err(TryCreateHandleError::SlotInUse);
         }
-        if self.handle_count() + 1 == L as u32 {
+        if self.handle_count() + 1 == self.buffer.data.len() as u32 {
             return Err(TryCreateHandleError::MaxHandles);
         }
         let digest = Self {
@@ -300,7 +299,7 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
     /// The only time this can fail is if the buffer already has its maximum number of handles. In
     /// this case, this method will eagerly fail and will not wait for an empty spot to become
     /// available.
-    pub async fn create_handle(&mut self) -> Option<Self> {
+    pub async fn create_handle<const L: usize, >(&mut self) -> Option<Self> {
         if self.handle_count() + 1 == L as u32 {
             return None;
         }
@@ -326,7 +325,7 @@ pub enum TryCreateHandleError {
     SlotInUse,
 }
 
-impl<const L: usize, T> Deref for TriplicateHandle<T, L> {
+impl<T> Deref for TriplicateHandle<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -334,11 +333,11 @@ impl<const L: usize, T> Deref for TriplicateHandle<T, L> {
         // On construction, every handle has a different index. This means they "point" to a unique
         // element in the triplicate buffer. A handle can rotate only if there is no handle
         // "pointing" to the next element. This ensure that every handles has a unique index.
-        unsafe { &*self.buffer.data[self.index].get() }
+        unsafe { &*self.buffer.data[self.index].inner.get() }
     }
 }
 
-impl<const L: usize, T> DerefMut for TriplicateHandle<T, L> {
+impl<T> DerefMut for TriplicateHandle<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY CHECK:
         // This same safety check that applies to the `Deref` impl also applies here with an
@@ -348,11 +347,11 @@ impl<const L: usize, T> DerefMut for TriplicateHandle<T, L> {
         // reference to the inner data will never be returned from a method that takes a shared
         // reference to the handle. Since this method takes an exclusive reference, it is safe to
         // return an exclusive reference.
-        unsafe { &mut *self.buffer.data[self.index].get() }
+        unsafe { &mut *self.buffer.data[self.index].inner.get() }
     }
 }
 
-impl<const L: usize, T> Drop for TriplicateHandle<T, L> {
+impl<T> Drop for TriplicateHandle<T> {
     fn drop(&mut self) {
         let mask = u64::MAX & !(0b1 << self.index);
         // Mask out this handles active index, making it available for other handles to use.
@@ -362,12 +361,12 @@ impl<const L: usize, T> Drop for TriplicateHandle<T, L> {
 
 // TODO: Docs
 #[must_use = "The rotate method returns a future that must be `await`ed. Dropping this will leave the handle unrotated"]
-struct RotationFut<'a, T, const L: usize> {
+struct RotationFut<'a, T> {
     waker: Option<Waker>,
-    handle: &'a mut TriplicateHandle<T, L>,
+    handle: &'a mut TriplicateHandle<T>,
 }
 
-impl<'a, T, const L: usize> Future for RotationFut<'a, T, L> {
+impl<'a, T> Future for RotationFut<'a, T> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -387,13 +386,13 @@ impl<'a, T, const L: usize> Future for RotationFut<'a, T, L> {
 
 // TODO: Docs
 #[must_use = "The rotate method returns a future that must be `await`ed. Dropping this will leave the handle unrotated"]
-struct CreationFut<'a, T, const L: usize> {
+struct CreationFut<'a, T> {
     waker: Option<Waker>,
-    handle: &'a mut TriplicateHandle<T, L>,
+    handle: &'a mut TriplicateHandle<T>,
 }
 
-impl<'a, T, const L: usize> Future for CreationFut<'a, T, L> {
-    type Output = TriplicateHandle<T, L>;
+impl<'a, T> Future for CreationFut<'a, T> {
+    type Output = TriplicateHandle<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -411,32 +410,43 @@ impl<'a, T, const L: usize> Future for CreationFut<'a, T, L> {
 }
 
 // TODO: Docs
-struct TriplicateInner<T, const L: usize = 3> {
-    data: [UnsafeCell<T>; L],
+struct TriplicateInner<T: ?Sized> {
     indices: AtomicU64,
+    data: T,
 }
 
-impl<const L: usize, T> TriplicateInner<T, L> {
-    /// SAFETY:
-    /// This method is marked as `unsafe` because it does not check that `L` or `count` uphold the
-    /// required safety invariants. The caller must ensure:
-    ///  - `L` is at most 64
-    ///  - `count` is strictly less than `L`
-    unsafe fn new<F: FnMut() -> T>(count: usize, mut f: F) -> Self {
-        let data = std::array::from_fn(|_| UnsafeCell::new(f()));
-        let mut indices = u64::MAX;
-        for i in count..64 {
-            indices ^= 0b1 << i;
-        }
-        // TODO: Remove this after testing.
-        assert_eq!(indices.count_ones(), count as u32);
-        let indices = AtomicU64::new(indices);
-        Self { data, indices }
+/// SAFETY:
+/// This method is marked as `unsafe` because it does not check that `L` or `count` uphold the
+/// required safety invariants. The caller must ensure:
+///  - `L` is at most 64
+///  - `count` is strictly less than `L`
+unsafe fn new_triplicate_inner<const L: usize, T, F>(
+    count: usize,
+    mut f: F,
+) -> TriplicateInner<[InnerCell<T>; L]>
+where
+    F: FnMut() -> T,
+{
+    let data = std::array::from_fn(|_| InnerCell {
+        inner: UnsafeCell::new(f()),
+    });
+    let mut indices = u64::MAX;
+    for i in count..64 {
+        indices ^= 0b1 << i;
     }
+    // TODO: Remove this after testing.
+    assert_eq!(indices.count_ones(), count as u32);
+    let indices = AtomicU64::new(indices);
+    TriplicateInner { data, indices }
+}
+
+struct InnerCell<T> {
+    inner: UnsafeCell<T>,
+    // TODO: This will also store the Mutex<Option<Waker>> for async stuff.
 }
 
 // TODO: Need to do extra verification around this...
-unsafe impl<const L: usize, T> Sync for TriplicateInner<T, L> where T: Send + Sync {}
+unsafe impl<T> Sync for InnerCell<T> where T: Send + Sync {}
 
 #[cfg(test)]
 mod tests {
@@ -448,15 +458,15 @@ mod tests {
 
     #[test]
     fn send_sync() {
-        let [h1, _h2]: [TriplicateHandle<_, 3>; 2] = TriplicateBounds::new().construct::<Vec<u8>>();
+        let [h1, _h2]: [TriplicateHandle<_>; 2] = TriplicateBounds::<3>::new().construct::<Vec<u8>>();
         is_send(&h1);
         is_sync(&h1);
     }
 
     #[test]
     fn bounds_check() {
-        let [h1, _h2, _h3]: [TriplicateHandle<_, 3>; 3] =
-            TriplicateBounds::new().construct::<Vec<u8>>();
+        let [h1, _h2, _h3]: [TriplicateHandle<_>; 3] =
+            TriplicateBounds::<3, 3>::new().construct::<Vec<u8>>();
         assert!(h1.is_empty())
     }
 }
