@@ -183,7 +183,9 @@ impl<T> TriplicateHandle<T> {
 
     /// Attempts to construct a triplicate buffer by moving to runtime the checks that `TriplicateBounds`
     /// provides at compile-time. This method will create a buffer full of default values.
-    pub fn try_construct<const L: usize>(count: usize) -> Result<Vec<Self>, TriplicateConstructionError>
+    pub fn try_construct<const L: usize>(
+        count: usize,
+    ) -> Result<Vec<Self>, TriplicateConstructionError>
     where
         T: Default,
     {
@@ -299,7 +301,7 @@ impl<T> TriplicateHandle<T> {
     /// The only time this can fail is if the buffer already has its maximum number of handles. In
     /// this case, this method will eagerly fail and will not wait for an empty spot to become
     /// available.
-    pub async fn create_handle<const L: usize, >(&mut self) -> Option<Self> {
+    pub async fn create_handle<const L: usize>(&mut self) -> Option<Self> {
         if self.handle_count() + 1 == L as u32 {
             return None;
         }
@@ -448,25 +450,21 @@ struct InnerCell<T> {
 // TODO: Need to do extra verification around this...
 unsafe impl<T> Sync for InnerCell<T> where T: Send + Sync {}
 
+const _: () = {
+    const fn is_send<T: Send>() {}
+    const fn is_sync<T: Sync>() {}
+    is_send::<TriplicateHandle<Vec<u8>>>();
+    is_sync::<TriplicateHandle<Vec<u8>>>();
+};
+
 #[cfg(test)]
 mod tests {
     use crate::{TriplicateBounds, TriplicateHandle};
 
-    fn is_send<T: Send>(_: &T) {}
-
-    fn is_sync<T: Sync>(_: &T) {}
-
-    #[test]
-    fn send_sync() {
-        let [h1, _h2]: [TriplicateHandle<_>; 2] = TriplicateBounds::<3>::new().construct::<Vec<u8>>();
-        is_send(&h1);
-        is_sync(&h1);
-    }
-
     #[test]
     fn bounds_check() {
-        let [h1, _h2, _h3]: [TriplicateHandle<_>; 3] =
-            TriplicateBounds::<3, 3>::new().construct::<Vec<u8>>();
+        let [h1, _h2]: [TriplicateHandle<_>; 2] =
+            TriplicateBounds::<3, 2>::new().construct::<Vec<u8>>();
         assert!(h1.is_empty())
     }
 }
