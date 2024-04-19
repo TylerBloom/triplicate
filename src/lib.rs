@@ -74,15 +74,47 @@ use std::{
 #[non_exhaustive]
 pub struct TriplicateBounds<const L: usize = 3, const H: usize = 2>;
 
+// TODO: Document the reasoning behind these goofy consts and const fns
+
+/// Compile-time bounds checking is a bit wonky in Rust (when the invariants aren't easily encoded
+/// in the type system), but it is possible. This ZST is part of that checking. See the docs on
+/// `TriplicateBounds::new` for why you might want this. These docs will focus on the how.
+///
+/// Since [inline-consts](https://rust-lang.github.io/rfcs/2920-inline-const.html) are still
+/// unstable, we can not force a `const fn` to be ran at compile time, but that's exactly what we
+/// want here. To get around that, we can have the `const fn new` method use a const on
+/// `TriplicateBounds`. The usage of this const, even if trivial, forces the check to happen at
+/// compile-time.
+///
+/// This type is private and is only returned by the `bounds_check` `const fn`, which will always
+/// return this type (or panic). To ensure that this type is only every constructed at
+/// compile-time, `bounds_check` is used to define an associated constant for `TriplicateBounds`.
+/// This constant is then used during the `new` method, where it is (trivially) destructured and
+/// the bounds object is returned.
+struct ValidBounds;
+
+/// This method provides the bounds checks for a triplicate but panics if they are not valid. This
+/// method is only meant to be ran at compile time in order to sidestep runtime bounds checking.
+/// Runtime bounds checking is available directly on the `TriplicateHandle`. This is only used for
+/// the `TriplicateBounds`.
+const fn bounds_check<const L: usize, const H: usize>() -> ValidBounds {
+    if L > 64 {
+        panic!("Triplicate can not contain more than 64 elements.")
+    } else if H >= L {
+        panic!("Triplicate must have more elements than handles.")
+    } else {
+        ValidBounds
+    }
+}
+
 impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
+    const CHECK: ValidBounds = bounds_check::<L, H>();
+
+    // TODO: Document this method and explain why the
     pub const fn new() -> Self {
-        if L > 64 {
-            panic!("Triplicate can not contain more than 64 elements.");
+        match Self::CHECK {
+            ValidBounds => Self,
         }
-        if H >= L {
-            panic!("Triplicate must have more elements than handles.");
-        }
-        Self
     }
 
     /// This method is called at runtime, but we already know that the bound conditions have
@@ -104,6 +136,12 @@ impl<const L: usize, const H: usize> TriplicateBounds<L, H> {
 
     pub fn construct_with_copies<T: Clone>(self, val: T) -> [TriplicateHandle<T, L>; H] {
         self.construct_with(|| val.clone())
+    }
+}
+
+impl<const L: usize, const H: usize> Default for TriplicateBounds<L, H> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -198,8 +236,8 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
         let mask = u64::MAX & !(0b1 << self.index);
         self.index = self.next_index();
         let val = 0b1 << self.next_index();
-        self.buffer.indices.fetch_or(val, Ordering::Relaxed);
-        self.buffer.indices.fetch_add(mask, Ordering::Relaxed);
+        self.buffer.indices.fetch_or(val, Ordering::AcqRel);
+        self.buffer.indices.fetch_add(mask, Ordering::AcqRel);
         Ok(&mut *self)
     }
 
@@ -211,9 +249,10 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
         }
     }
 
+
     /// Checks to see if there is another handle preventing this handle from rotating.
     pub fn can_rotate(&self) -> bool {
-        0b1 << self.next_index() & self.buffer.indices.load(Ordering::Relaxed) != 0
+        0b1 << self.next_index() & self.buffer.indices.load(Ordering::Acquire) != 0
     }
 
     /// Moves the handle over by one element. If another handle has access to the next element,
@@ -250,7 +289,7 @@ impl<const L: usize, T> TriplicateHandle<T, L> {
             buffer: self.buffer.clone(),
         };
         let val = 0b1 << self.next_index();
-        self.buffer.indices.fetch_or(val, Ordering::Relaxed);
+        self.buffer.indices.fetch_or(val, Ordering::AcqRel);
         Ok(digest)
     }
 
@@ -317,7 +356,7 @@ impl<const L: usize, T> Drop for TriplicateHandle<T, L> {
     fn drop(&mut self) {
         let mask = u64::MAX & !(0b1 << self.index);
         // Mask out this handles active index, making it available for other handles to use.
-        self.buffer.indices.fetch_and(mask, Ordering::Relaxed);
+        self.buffer.indices.fetch_and(mask, Ordering::AcqRel);
     }
 }
 
@@ -412,5 +451,12 @@ mod tests {
         let [h1, _h2]: [TriplicateHandle<_, 3>; 2] = TriplicateBounds::new().construct::<Vec<u8>>();
         is_send(&h1);
         is_sync(&h1);
+    }
+
+    #[test]
+    fn bounds_check() {
+        let [h1, _h2, _h3]: [TriplicateHandle<_, 3>; 3] =
+            TriplicateBounds::new().construct::<Vec<u8>>();
+        assert!(h1.is_empty())
     }
 }
